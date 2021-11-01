@@ -19,6 +19,7 @@ package main
 import (
 	"bytes"
 	utiljson "encoding/json"
+	"flag"
 	"fmt"
 	"net"
 	"os"
@@ -37,9 +38,13 @@ import (
 	"github.com/golang/glog"
 )
 
+var (
+	// name of nat chain for iptables masquerade rules
+	masqChain utiliptables.Chain
+)
+
 const (
 	// name of nat chain for iptables masquerade rules
-	masqChain     = utiliptables.Chain("IP-MASQ-AGENT")
 	linkLocalCIDR = "169.254.0.0/16"
 	// path to a yaml or json file
 	configPath = "/etc/config/ip-masq-agent"
@@ -47,9 +52,10 @@ const (
 
 // config object
 type MasqConfig struct {
-	NonMasqueradeCIDRs []string `json:"nonMasqueradeCIDRs"`
-	MasqLinkLocal      bool     `json:"masqLinkLocal"`
-	ResyncInterval     Duration `json:"resyncInterval"`
+	NonMasqueradeCIDRs  []string `json:"nonMasqueradeCIDRs"`
+	NonMasqueradeSCIDRs []string `json:"nonMasqueradeSCIDRs"`
+	MasqLinkLocal       bool     `json:"masqLinkLocal"`
+	ResyncInterval      Duration `json:"resyncInterval"`
 }
 
 // Go's JSON unmarshaler can't handle time.ParseDuration syntax when unmarshaling into time.Duration, so we do it here
@@ -73,9 +79,10 @@ func (d *Duration) UnmarshalJSON(json []byte) error {
 func NewMasqConfig() *MasqConfig {
 	return &MasqConfig{
 		// Note: RFC 1918 defines the private ip address space as 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16
-		NonMasqueradeCIDRs: []string{"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"},
-		MasqLinkLocal:      false,
-		ResyncInterval:     Duration(60 * time.Second),
+		NonMasqueradeCIDRs:  []string{"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"},
+		NonMasqueradeSCIDRs: []string{},
+		MasqLinkLocal:       false,
+		ResyncInterval:      Duration(60 * time.Second),
 	}
 }
 
@@ -98,6 +105,10 @@ func NewMasqDaemon(c *MasqConfig) *MasqDaemon {
 }
 
 func main() {
+	masqChainFlag := flag.String("masq-chain", "IP-MASQ-AGENT", `Name of nat chain for iptables masquerade rules.`)
+	flag.Parse()
+	masqChain = utiliptables.Chain(*masqChainFlag)
+
 	c := NewMasqConfig()
 
 	logs.InitLogs()
@@ -164,6 +175,7 @@ func (m *MasqDaemon) syncConfig(fs fakefs.FileSystem) error {
 	if _, err = fs.Stat(configPath); os.IsNotExist(err) {
 		// file does not exist, use defaults
 		m.config.NonMasqueradeCIDRs = c.NonMasqueradeCIDRs
+		m.config.NonMasqueradeSCIDRs = c.NonMasqueradeSCIDRs
 		m.config.MasqLinkLocal = c.MasqLinkLocal
 		m.config.ResyncInterval = c.ResyncInterval
 		glog.Infof("no config file found at %q", configPath)
@@ -236,10 +248,12 @@ func validateCIDR(cidr string) error {
 }
 
 func (m *MasqDaemon) syncMasqRules() error {
+	fmt.Println("make sure our custom chain for non-masquerade exists")
 	// make sure our custom chain for non-masquerade exists
 	m.iptables.EnsureChain(utiliptables.TableNAT, masqChain)
 
 	// ensure that any non-local in POSTROUTING jumps to masqChain
+	fmt.Println("ensure that any non-local in POSTROUTING jumps to masqChain")
 	if err := m.ensurePostroutingJump(); err != nil {
 		return err
 	}
@@ -251,33 +265,45 @@ func (m *MasqDaemon) syncMasqRules() error {
 
 	// link-local CIDR is always non-masquerade
 	if !m.config.MasqLinkLocal {
+		fmt.Println("linkLocalCIDR:", lines)
 		writeNonMasqRule(lines, linkLocalCIDR)
+		fmt.Println("linkLocalCIDR: success!")
 	}
 
 	// non-masquerade for user-provided CIDRs
 	for _, cidr := range m.config.NonMasqueradeCIDRs {
+		fmt.Println("writeNonMasqRule:", cidr)
 		writeNonMasqRule(lines, cidr)
+	}
+
+	for _, cidr := range m.config.NonMasqueradeSCIDRs {
+		fmt.Println("writeNonMasqSRule:", cidr)
+		writeNonMasqSRule(lines, cidr)
+
 	}
 
 	// masquerade all other traffic that is not bound for a --dst-type LOCAL destination
 	writeMasqRule(lines)
 
+	fmt.Println("COMMIT", lines)
 	writeLine(lines, "COMMIT")
+
+	fmt.Println("Invoking RestoreAll")
 	if err := m.iptables.RestoreAll(lines.Bytes(), utiliptables.NoFlushTables, utiliptables.NoRestoreCounters); err != nil {
+		fmt.Println("failed to restore", err)
 		return err
 	}
+	fmt.Println("RestoreAll successfull")
 	return nil
 }
 
-// NOTE(mtaufen): iptables requires names to be <= 28 characters, and somehow prepending "-m comment --comment " to this string makes it think this condition is violated
-// Feel free to dig around in iptables and see if you can figure out exactly why; I haven't had time to fully trace how it parses and handle subcommands.
-// If you want to investigate, get the source via `git clone git://git.netfilter.org/iptables.git`, `git checkout v1.4.21` (the version I've seen this issue on,
-// though it may also happen on others), and start with `git grep XT_EXTENSION_MAXNAMELEN`.
-const postroutingJumpComment = "ip-masq-agent: ensure nat POSTROUTING directs all non-LOCAL destination traffic to our custom " + string(masqChain) + " chain"
+func postroutingJumpComment() string {
+	return fmt.Sprintf("ip-masq-agent: ensure nat POSTROUTING directs all non-LOCAL destination traffic to our custom %s chain", masqChain)
+}
 
 func (m *MasqDaemon) ensurePostroutingJump() error {
 	if _, err := m.iptables.EnsureRule(utiliptables.Append, utiliptables.TableNAT, utiliptables.ChainPostrouting,
-		"-m", "comment", "--comment", postroutingJumpComment,
+		"-m", "comment", "--comment", postroutingJumpComment(),
 		// postroutingJumpComment,
 		"-m", "addrtype", "!", "--dst-type", "LOCAL", "-j", string(masqChain)); err != nil {
 		return fmt.Errorf("failed to ensure that %s chain %s jumps to MASQUERADE: %v", utiliptables.TableNAT, masqChain, err)
@@ -286,11 +312,18 @@ func (m *MasqDaemon) ensurePostroutingJump() error {
 }
 
 const nonMasqRuleComment = `-m comment --comment "ip-masq-agent: cluster-local traffic should not be subject to MASQUERADE"`
+const nonMasqSRuleComment = `-m comment --comment "ip-masq-agent: nonMasqueradeSCIDRs  traffic should not be subject to MASQUERADE"`
 
 func writeNonMasqRule(lines *bytes.Buffer, cidr string) {
 	writeRule(lines, utiliptables.Append, masqChain,
 		nonMasqRuleComment,
 		"-m", "addrtype", "!", "--dst-type", "LOCAL", "-d", cidr, "-j", "RETURN")
+}
+
+func writeNonMasqSRule(lines *bytes.Buffer, cidr string) {
+	writeRule(lines, utiliptables.Append, masqChain,
+		nonMasqSRuleComment,
+		"-s", cidr, "-j", "RETURN")
 }
 
 const masqRuleComment = `-m comment --comment "ip-masq-agent: outbound traffic should be subject to MASQUERADE (this match must come after cluster-local CIDR matches)"`
